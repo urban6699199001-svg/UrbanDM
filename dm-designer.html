@@ -197,7 +197,7 @@ function calculateDM() {
   const rates = state.productData.rates;
   const age = state.age;
   const queryAge = state.queryAge;
-  const queryYear = queryAge - age + 1;
+  const queryYear = queryAge - age + 1;  // 包含查詢年齡那一年
   const payYears = plan.payYears;
   const maturityYear = payYears + 1;
   
@@ -679,17 +679,14 @@ function renderPreview() {
       
       <!-- Table 62% -->
       <div class="h-[62%] px-6 py-4 flex flex-col">
-        <div class="flex justify-between items-center mb-2">
+        <div class="flex justify-between items-center mb-3">
           <div>
             <h2 class="text-4xl font-black navy"><span class="gold italic font-serif">The</span> Private Plan</h2>
-            <p class="text-sm text-gray-500">${state.productData?.info?.fullName || ''}</p>
           </div>
           <div class="text-right">
             <div class="bg-navy text-amber-300 px-6 py-2 rounded-full font-bold">${state.age}歲 ${genderText} 貴賓專屬</div>
-            <p class="text-sm gold mt-1">查詢年齡: ${state.queryAge}歲 ｜ ${payYears}年期</p>
           </div>
         </div>
-        <p class="text-xs text-purple-600 mb-2 text-right">📊 假設：${levelText} ｜ ${methodText}</p>
         
         <div class="flex-1 border-2 border-amber-300/50 rounded-3xl overflow-hidden">
           <table class="w-full h-full">
