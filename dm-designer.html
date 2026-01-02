@@ -83,6 +83,10 @@ const state = {
   planName3: '尊榮方案',
   exchangeRate: 32.5,
   displayCurrency: 'USD',
+  
+  // 紅利設定
+  dividendMethod: '繳清保險金額',  // 繳清保險金額 / 儲存生息 / 現金給付
+  dividendLevel: 'high',           // high / medium / low / zero
 };
 
 // 晚期開始領取商品（不顯示 1~y年總領）
@@ -98,38 +102,67 @@ async function init() {
   if (params.get('gender')) state.gender = params.get('gender');
   if (params.get('coverage')) state.baseCoverage = parseFloat(params.get('coverage'));
   if (params.get('queryAge')) state.queryAge = parseInt(params.get('queryAge'));
+  if (params.get('dividendMethod')) state.dividendMethod = params.get('dividendMethod');
+  if (params.get('dividendLevel')) state.dividendLevel = params.get('dividendLevel');
   
-  // 載入商品列表
+  // 載入商品列表（只載入 info 和 plans，不載入 rates）
   const snapshot = await db.ref('products').once('value');
   const data = snapshot.val() || {};
   
   for (const [code, product] of Object.entries(data)) {
     if (code.startsWith('P') && product.info) {
-      state.products[code] = product;
+      // 只存 info 和 plans，不存 rates（太大）
+      state.products[code] = {
+        info: product.info,
+        plans: product.plans
+      };
     }
   }
   
-  // 如果有預選商品，載入資料
+  // 如果有預選商品，載入完整資料（包含 rates）
   if (state.selectedProduct && state.products[state.selectedProduct]) {
-    state.productData = state.products[state.selectedProduct];
+    await loadProductRates(state.selectedProduct);
     if (!state.selectedPlan) {
       const plans = Object.keys(state.productData.plans || {});
       if (plans.length > 0) state.selectedPlan = plans[0];
     }
-    state.displayCurrency = state.productData.info.currency;
   }
   
   state.loading = false;
   render();
 }
 
+// 載入單一商品的 rates
+async function loadProductRates(code) {
+  const ratesSnap = await db.ref('products/' + code + '/rates').once('value');
+  const rates = ratesSnap.val();
+  
+  state.productData = {
+    ...state.products[code],
+    rates: rates
+  };
+  state.displayCurrency = state.productData.info.currency;
+}
+
 // 選擇商品
-function selectProduct(code) {
+async function selectProduct(code) {
   state.selectedProduct = code;
-  state.productData = state.products[code];
+  state.loading = true;
+  render();
+  
+  await loadProductRates(code);
+  
   const plans = Object.keys(state.productData.plans || {});
   state.selectedPlan = plans.length > 0 ? plans[0] : null;
-  state.displayCurrency = state.productData.info.currency;
+  
+  // 設定預設紅利給付方式（第一個選項）
+  const dividendOptions = state.productData.info?.dividendOptions || ['繳清保險金額'];
+  state.dividendMethod = dividendOptions[0];
+  
+  // 設定預設分紅假設（高分紅）
+  state.dividendLevel = 'high';
+  
+  state.loading = false;
   render();
 }
 
@@ -154,7 +187,7 @@ function printDM() {
   window.print();
 }
 
-// 計算 DM 數據
+// 計算 DM 數據（使用 v7.27 完整計算邏輯）
 function calculateDM() {
   if (!state.productData || !state.selectedPlan) return null;
   
@@ -171,16 +204,33 @@ function calculateDM() {
   const genderCode = state.gender === 'male' ? '01' : '02';
   const ageStr = age.toString().padStart(2, '0');
   const baseKey = `${plan.prefix}${genderCode}${ageStr}`;
-  const bonuKey = `${baseKey}1`; // 高分紅
+  
+  // 紅利 key：高/中分紅用 2，低分紅用 1
+  const bonuSuffix = (state.dividendLevel === 'low' || state.dividendLevel === 'zero') ? '1' : '2';
+  const bonuKey = `${baseKey}${bonuSuffix}`;
+  const isZeroDividend = state.dividendLevel === 'zero';
+  
+  // 紅利給付方式
+  const isCashDividend = state.dividendMethod === '現金給付';
+  const isStoredInterest = state.dividendMethod === '儲存生息';
+  const isPaidUp = !isCashDividend && !isStoredInterest;  // 繳清保險金額
+  
+  // 儲存生息利率
+  const storedInterestRate = state.productData.info?.storedInterestRate || 0.0265;
+  const monthlyRate = storedInterestRate / 12;
+  const annualFactor = Math.pow(1 + monthlyRate, 12);
   
   // 取得費率
   const gpRate = rates.gp?.[baseKey];
   const cvRates = rates.cv?.[baseKey] || [];
   const dieRates = rates.die?.[baseKey] || [];
-  const bonuRates = rates.bonu?.[bonuKey] || rates.bonu?.[baseKey] || [];
-  const bonuCvRates = rates.bonu_cv?.[bonuKey] || rates.bonu_cv?.[baseKey] || [];
-  const bonuDieRates = rates.bonu_die?.[bonuKey] || rates.bonu_die?.[baseKey] || [];
+  const die2Rates = rates.die2?.[baseKey] || [];
+  const bonuRates = isZeroDividend ? [] : (rates.bonu?.[bonuKey] || rates.bonu?.[baseKey] || []);
+  const bonuCvRates = isZeroDividend ? [] : (rates.bonu_cv?.[bonuKey] || rates.bonu_cv?.[baseKey] || []);
+  const bonuDieRates = isZeroDividend ? [] : (rates.bonu_die?.[bonuKey] || rates.bonu_die?.[baseKey] || []);
   const srvRates = rates.srv?.[baseKey] || [];
+  const pvfbRates = rates.pvfb?.[baseKey] || [];
+  const pvfb0Rates = rates.pvfb0?.[baseKey] || [];
   
   if (typeof gpRate !== 'number') {
     console.error('找不到費率', baseKey);
@@ -191,17 +241,18 @@ function calculateDM() {
   const hasSrv = srvRates.length > 0 && srvRates.some(v => v > 0);
   const isLateStart = LATE_START_PRODUCTS.some(p => state.selectedProduct.startsWith(p));
   
-  // 找出生存金開始年度
+  // 找出生存金開始年度和年齡
   let survivalStartYear = -1;
+  let survivalStartAge = -1;
   if (hasSrv) {
     for (let i = 0; i < srvRates.length; i++) {
-      if (srvRates[i] > 0 || (bonuRates[i] || 0) > 0) {
+      if (srvRates[i] > 0) {
         survivalStartYear = i + 1;
+        survivalStartAge = age + survivalStartYear - 1;
         break;
       }
     }
   }
-  const survivalStartAge = survivalStartYear > 0 ? age + survivalStartYear - 1 : -1;
   
   // 計算三個方案
   const multipliers = [1, state.multiplier2, state.multiplier3];
@@ -212,48 +263,133 @@ function calculateDM() {
     const annualPremium = Math.ceil(gpRate * coverage);
     const totalDeposit = annualPremium * payYears;
     
-    // 繳費期間總領 (1~繳費年期)
+    // ========== 使用 v7.27 完整計算邏輯 ==========
+    let cumSurvival = 0;
+    let reducedCumPaidUp = 0;      // 累計繳清保額（繳清保險金額模式）
+    let cumStoredDividend = 0;     // 累計儲存生息紅利
+    let annualBenefitAtMaturity = 0;
     let payPeriodBenefit = 0;
-    if (hasSrv && !isLateStart) {
-      for (let i = 0; i < payYears && i < srvRates.length; i++) {
-        payPeriodBenefit += Math.ceil((srvRates[i] || 0) * coverage) + Math.ceil((bonuRates[i] || 0) * coverage);
+    
+    // 逐年計算到查詢年度
+    for (let year = 1; year <= Math.max(queryYear, maturityYear); year++) {
+      const idx = year - 1;
+      
+      // 步驟1: 當年紅利 K
+      const bonuRate = bonuRates[idx] || 0;
+      const kBase = bonuRate ? Math.round(bonuRate * coverage) : 0;
+      const kAdded = (isPaidUp && reducedCumPaidUp && bonuRate) ? Math.round(reducedCumPaidUp * bonuRate / 10000) : 0;
+      const annualDividendK = kBase + kAdded;
+      
+      // 儲存生息累積
+      if (isStoredInterest) {
+        if (year === 1) {
+          cumStoredDividend = kBase;
+        } else {
+          cumStoredDividend = Math.round(cumStoredDividend * annualFactor + kBase);
+        }
+      }
+      
+      // 步驟2: 計算當年繳清保額 M（僅繳清保險金額模式）
+      let paidUpThisYear = 0;
+      if (isPaidUp) {
+        const pvfbNext = pvfbRates[year] || 0;
+        paidUpThisYear = (annualDividendK > 0 && pvfbNext > 0) ? Math.ceil(annualDividendK / pvfbNext * 10000) : 0;
+      }
+      
+      // 步驟3: 更新累計繳清保額
+      if (isPaidUp) {
+        reducedCumPaidUp = Math.ceil(reducedCumPaidUp + paidUpThisYear);
+      }
+      
+      // 步驟4: 計算生存金（根據紅利給付方式）
+      const srvRate = srvRates[idx] || 0;
+      const survivalF = srvRate ? Math.round(srvRate * coverage) : 0;
+      const survivalO = (isPaidUp && srvRate && reducedCumPaidUp) ? Math.round(srvRate * reducedCumPaidUp / 10000) : 0;
+      
+      let survival;
+      if (isCashDividend) {
+        survival = survivalF + kBase;  // 現金給付：基本 + 當年紅利
+      } else if (isStoredInterest) {
+        survival = survivalF;          // 儲存生息：只有基本
+      } else {
+        survival = survivalF + survivalO;  // 繳清保險金額：基本 + 繳清保額組件
+      }
+      
+      cumSurvival += survival;
+      
+      // 記錄繳費期間總領
+      if (year <= payYears) {
+        payPeriodBenefit += survival;
+      }
+      
+      // 記錄滿期後第一年的生存金（或開始領取年度）
+      if (hasSrv && survivalStartYear > 0) {
+        if (year === Math.max(survivalStartYear, maturityYear)) {
+          annualBenefitAtMaturity = survival;
+        }
       }
     }
     
-    // 滿期每年領
-    const benefitYear = survivalStartYear > 0 ? Math.max(survivalStartYear, maturityYear) : maturityYear;
-    const annualBenefit = hasSrv && benefitYear <= srvRates.length
-      ? Math.ceil((srvRates[benefitYear - 1] || 0) * coverage) + Math.ceil((bonuRates[benefitYear - 1] || 0) * coverage)
-      : 0;
+    // 查詢年度的解約金（根據紅利給付方式）
+    const queryIdx = queryYear - 1;
+    const cvRate = cvRates[queryIdx] || 0;
+    const bonuCvRate = bonuCvRates[queryIdx] || 0;
+    const pvfb0Rate = pvfb0Rates[queryYear] || 0;
     
-    // 累積總領 (1~查詢年度)
-    let cumulativeBenefit = 0;
-    if (hasSrv) {
-      for (let i = 0; i < queryYear && i < srvRates.length; i++) {
-        cumulativeBenefit += Math.ceil((srvRates[i] || 0) * coverage) + Math.ceil((bonuRates[i] || 0) * coverage);
-      }
+    const surrenderB = cvRate ? Math.round(cvRate * coverage) : 0;
+    const surrenderE = (isPaidUp && reducedCumPaidUp && pvfb0Rate) ? Math.round(reducedCumPaidUp * pvfb0Rate / 10000) : 0;
+    const surrenderY = bonuCvRate ? Math.round(bonuCvRate * coverage) : 0;
+    
+    let surrenderValue;
+    if (isCashDividend) {
+      const lastKBase = (bonuRates[queryIdx] || 0) ? Math.round((bonuRates[queryIdx] || 0) * coverage) : 0;
+      surrenderValue = surrenderB + lastKBase + surrenderY;
+    } else if (isStoredInterest) {
+      surrenderValue = surrenderB + cumStoredDividend + surrenderY;
+    } else {
+      surrenderValue = surrenderB + surrenderE + surrenderY;
     }
     
-    // 解約金
-    const surrenderValue = queryYear > 0 && queryYear <= cvRates.length
-      ? Math.ceil((cvRates[queryYear - 1] || 0) * coverage) + Math.ceil((bonuCvRates[queryYear - 1] || 0) * coverage)
-      : 0;
+    // 查詢年度的身故保險金（根據紅利給付方式）
+    const dieRate = dieRates[queryIdx] || 0;
+    const die2Rate = die2Rates[queryIdx] || 0;
+    const bonuDieRate = bonuDieRates[queryIdx] || 0;
     
-    // 身故保險金
-    const deathBenefit = queryYear > 0 && queryYear <= dieRates.length
-      ? Math.ceil((dieRates[queryYear - 1] || 0) * coverage) + Math.ceil((bonuDieRates[queryYear - 1] || 0) * coverage)
-      : 0;
+    const deathA = dieRate ? Math.round(dieRate * coverage) : 0;
+    const deathD = (isPaidUp && reducedCumPaidUp && die2Rate) ? Math.round(reducedCumPaidUp * die2Rate / 10000) : 0;
+    const deathX = bonuDieRate ? Math.round(bonuDieRate * coverage) : 0;
+    
+    let deathBenefit;
+    if (isCashDividend) {
+      const lastKBase = (bonuRates[queryIdx] || 0) ? Math.round((bonuRates[queryIdx] || 0) * coverage) : 0;
+      deathBenefit = deathA + lastKBase + deathX;
+    } else if (isStoredInterest) {
+      deathBenefit = deathA + cumStoredDividend + deathX;
+    } else {
+      deathBenefit = deathA + deathD + deathX;
+    }
     
     // 總資產
-    const totalAsset = surrenderValue + cumulativeBenefit;
+    const totalAsset = surrenderValue + cumSurvival;
     
-    return { coverage, annualPremium, totalDeposit, payPeriodBenefit, annualBenefit, cumulativeBenefit, surrenderValue, deathBenefit, totalAsset };
+    return { 
+      coverage, 
+      annualPremium, 
+      totalDeposit, 
+      payPeriodBenefit,
+      annualBenefit: annualBenefitAtMaturity, 
+      cumulativeBenefit: cumSurvival, 
+      surrenderValue, 
+      deathBenefit, 
+      totalAsset 
+    };
   });
   
   return {
     plans,
     hasSrv,
     isLateStart,
+    survivalStartYear,
     survivalStartAge,
     payYears,
     currency: state.productData.info.currency
@@ -325,6 +461,42 @@ function renderControls() {
   html += `<div><label class="text-xs text-gray-500">基準保額(萬)</label><input type="number" value="${state.baseCoverage}" onchange="updateForm('baseCoverage',this.value)" class="w-full p-2 border rounded-lg text-sm"/></div>`;
   html += '</div></div>';
   
+  // 紅利設定（根據商品支援的選項動態顯示）
+  if (state.productData) {
+    const dividendOptions = state.productData.info?.dividendOptions || ['繳清保險金額'];
+    const levelOptions = state.productData.info?.dividendLevelOptions || ['高分紅', '中分紅', '低分紅'];
+    const levelMapping = {'高分紅': 'high', '中分紅': 'medium', '低分紅': 'low', '最可能紅利': 'medium', '較低紅利': 'low', '可能紅利金額為0': 'zero'};
+    
+    html += '<div class="mb-6 p-4 bg-purple-50 rounded-xl border border-purple-200">';
+    html += '<h3 class="text-sm font-bold text-purple-700 mb-3">• 紅利設定</h3>';
+    html += '<div class="grid grid-cols-1 gap-3">';
+    
+    // 紅利給付方式（如果有多個選項）
+    if (dividendOptions.length > 1) {
+      html += '<div><label class="text-xs text-purple-600">紅利給付方式</label>';
+      html += '<select onchange="updateForm(\'dividendMethod\',this.value)" class="w-full p-2 border border-purple-300 rounded-lg text-sm bg-white">';
+      for (const opt of dividendOptions) {
+        const selected = state.dividendMethod === opt ? 'selected' : '';
+        html += `<option value="${opt}" ${selected}>${opt}</option>`;
+      }
+      html += '</select></div>';
+    } else {
+      html += `<div class="text-xs text-purple-600">紅利給付方式：${dividendOptions[0]}</div>`;
+    }
+    
+    // 分紅假設
+    html += '<div><label class="text-xs text-purple-600">分紅假設</label>';
+    html += '<select onchange="updateForm(\'dividendLevel\',this.value)" class="w-full p-2 border border-purple-300 rounded-lg text-sm bg-white">';
+    for (const opt of levelOptions) {
+      const val = levelMapping[opt] || 'medium';
+      const selected = state.dividendLevel === val ? 'selected' : '';
+      html += `<option value="${val}" ${selected}>${opt}</option>`;
+    }
+    html += '</select></div>';
+    
+    html += '</div></div>';
+  }
+  
   // 顯示設定
   if (state.productData?.info?.currency === 'USD') {
     html += '<div class="mb-6">';
@@ -369,9 +541,14 @@ function renderPreview() {
     `;
   }
   
-  const { plans, hasSrv, isLateStart, survivalStartAge, payYears, currency } = result;
+  const { plans, hasSrv, isLateStart, survivalStartYear, survivalStartAge, payYears, currency } = result;
   const genderText = state.gender === 'male' ? '男性' : '女性';
   const currencyIcon = currency === 'USD' ? '美元' : '台幣';
+  
+  // 紅利設定文字
+  const levelTextMap = {'high': '高分紅', 'medium': '中分紅', 'low': '低分紅', 'zero': '零分紅'};
+  const levelText = levelTextMap[state.dividendLevel] || '高分紅';
+  const methodText = state.dividendMethod || '繳清保險金額';
   
   // 生成表格行
   let tableRows = '';
@@ -502,7 +679,7 @@ function renderPreview() {
       
       <!-- Table 62% -->
       <div class="h-[62%] px-6 py-4 flex flex-col">
-        <div class="flex justify-between items-center mb-3">
+        <div class="flex justify-between items-center mb-2">
           <div>
             <h2 class="text-4xl font-black navy"><span class="gold italic font-serif">The</span> Private Plan</h2>
             <p class="text-sm text-gray-500">${state.productData?.info?.fullName || ''}</p>
@@ -512,6 +689,7 @@ function renderPreview() {
             <p class="text-sm gold mt-1">查詢年齡: ${state.queryAge}歲 ｜ ${payYears}年期</p>
           </div>
         </div>
+        <p class="text-xs text-purple-600 mb-2 text-right">📊 假設：${levelText} ｜ ${methodText}</p>
         
         <div class="flex-1 border-2 border-amber-300/50 rounded-3xl overflow-hidden">
           <table class="w-full h-full">
