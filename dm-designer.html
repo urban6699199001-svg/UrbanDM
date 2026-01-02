@@ -197,7 +197,7 @@ function calculateDM() {
   const rates = state.productData.rates;
   const age = state.age;
   const queryAge = state.queryAge;
-  const queryYear = queryAge - age;
+  const queryYear = queryAge - age + 1;
   const payYears = plan.payYears;
   const maturityYear = payYears + 1;
   
