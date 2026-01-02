@@ -1,0 +1,1350 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>保險商品試算系統 v7.28</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+  <style>
+    body { font-family: 'Noto Sans TC', sans-serif; }
+    .glass { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.2); }
+    .spinner { border: 3px solid rgba(255,255,255,0.3); border-top-color: #60a5fa; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .table-scroll { max-height: 500px; overflow-y: auto; }
+    select option { background: #1e293b; color: white; }
+    @media print { body { background: white !important; } .no-print { display: none !important; } .glass { background: white !important; } * { color: black !important; } }
+    /* 固定表頭背景 */
+    thead.sticky-header th { background: #1e293b; position: sticky; top: 0; z-index: 10; }
+    /* 每5年底色 */
+    tr.year-5n { background: rgba(59, 130, 246, 0.15) !important; }
+    /* 部分解約標示 */
+    tr.partial-surrender-row { background: rgba(249, 115, 22, 0.2) !important; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
+<div id="app"></div>
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyBgBHsM92s9DH23uXDeo3EWQ5NjAM5nW0U",
+  authDomain: "urban-os-v1.firebaseapp.com",
+  databaseURL: "https://urban-os-v1-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "urban-os-v1",
+  storageBucket: "urban-os-v1.firebasestorage.app",
+  messagingSenderId: "594831737040",
+  appId: "1:594831737040:web:f16c007399bf16843f1ed5"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+const state = { 
+  loading: true, error: null, step: 1, products: {}, selectedProduct: null, selectedPlan: null, rates: null,
+  form: { name: '', gender: '男', birthDate: '', coverage: '', targetPremiumTWD: '', paymentMethod: '金融機構轉帳', employeeDiscount: false, dividendLevel: 'medium', dividendMethod: '' },
+  result: null, displayYears: 30,
+  // 匯率設定
+  exchangeRateMode: 'fixed', // 'fixed' 或 'yearly'
+  exchangeRate: 32.5,        // 固定匯率
+  yearlyRates: {},           // 逐年匯率 {1: 32.5, 2: 32.0, ...}
+  showTWD: false,
+  reducedPaidUpYear: 0,
+  reducedPaidUpRatio: 0,
+  // 搜尋
+  searchKeyword: '',
+  // 🆕 部分解約設定
+  partialSurrenderMode: false,  // 是否啟用部分解約
+  partialSurrenders: []  // [{fromYear, toYear, amountPerYear}]
+};
+
+// 取得指定年度的匯率
+function getExchangeRate(year = 1) {
+  if (state.exchangeRateMode === 'fixed') return state.exchangeRate;
+  return state.yearlyRates[year] || state.exchangeRate;
+}
+
+// 設定匯率模式
+function setExchangeRateMode(mode) {
+  state.exchangeRateMode = mode;
+  if (mode === 'yearly' && Object.keys(state.yearlyRates).length === 0) {
+    // 初始化逐年匯率（預設前10年）
+    for (let i = 1; i <= 30; i++) {
+      state.yearlyRates[i] = state.exchangeRate;
+    }
+  }
+  render();
+}
+
+// 設定逐年匯率
+function setYearlyRate(year, rate) {
+  state.yearlyRates[year] = parseFloat(rate) || state.exchangeRate;
+  render();
+}
+
+// 搜尋商品
+function setSearchKeyword(keyword) {
+  state.searchKeyword = keyword.toLowerCase();
+  render();
+}
+
+// 🆕 部分解約函數（v7.2: 需要重新計算 benefits）
+function togglePartialSurrenderMode(enabled) {
+  state.partialSurrenderMode = enabled;
+  if (enabled && state.partialSurrenders.length === 0) {
+    state.partialSurrenders.push({ fromYear: 10, toYear: 20, amountPerYear: 5 });
+  }
+  // ✅ v7.2: 重新計算（因為部分提領會在計算過程中縮減 N）
+  if (state.result) doCalculate();
+  else render();
+}
+
+function addPartialSurrender() {
+  state.partialSurrenders.push({ fromYear: 10, toYear: 20, amountPerYear: 5 });
+  if (state.result) doCalculate();
+  else render();
+}
+
+function removePartialSurrender(idx) {
+  state.partialSurrenders.splice(idx, 1);
+  if (state.result) doCalculate();
+  else render();
+}
+
+function updatePartialSurrender(idx, field, value) {
+  state.partialSurrenders[idx][field] = parseFloat(value) || 0;
+  // ✅ v7.2: 重新計算
+  if (state.result) doCalculate();
+  else render();
+}
+
+// 計算部分解約後的利益
+// ✅ v7.1 正確邏輯（從 N 源頭縮減，連動所有值）
+// 工廠做法：部分提領 → 縮減累計保額 N → K、M、解約金、身故金全部連動減少
+// 
+// 步驟：
+// 1. 計算當年解約金（基於當前 nRatio）
+// 2. 計算縮減比例 = 提領金額 / 當年解約金
+// 3. nRatio = nRatio × (1 - 縮減比例)  ← 累積縮減
+// 4. 所有值乘以 nRatio
+function calculateWithPartialSurrender(benefits, surrenders, currency, originalCoverage, minCoverage) {
+  if (!surrenders || surrenders.length === 0) return benefits;
+  
+  // 建立解約金額對照表（萬TWD）
+  const surrenderMap = {};
+  for (const s of surrenders) {
+    for (let y = s.fromYear; y <= s.toYear; y++) {
+      surrenderMap[y] = (surrenderMap[y] || 0) + s.amountPerYear;
+    }
+  }
+  
+  let cumPartialSurrender = 0;  // 累計部份提領金額（原幣）
+  let cumSurvivalAfter = 0;
+  let nRatio = 1;  // ✅ N 的累計縮減比例（核心變數）
+  
+  const rate = state.exchangeRate;
+  const isUSD = currency === 'USD';
+  
+  return benefits.map((row, idx) => {
+    const year = row.year;
+    const surrenderAmountWanTWD = surrenderMap[year] || 0;
+    
+    let partialSurrenderValue = 0;
+    
+    if (surrenderAmountWanTWD > 0) {
+      // 目標提領金額（轉原幣）
+      const targetValue = isUSD ? (surrenderAmountWanTWD * 10000 / rate) : (surrenderAmountWanTWD * 10000);
+      
+      // ✅ 當年解約金 = 原始解約金 × nRatio（基於已縮減的 N）
+      const currentSurrender = Math.round(row.surrenderTotal * nRatio);
+      
+      if (targetValue >= currentSurrender) {
+        partialSurrenderValue = Math.max(0, currentSurrender);
+      } else {
+        partialSurrenderValue = targetValue;
+      }
+      
+      // ✅ 關鍵：縮減 nRatio（模擬縮減 N）
+      if (currentSurrender > 0 && partialSurrenderValue > 0) {
+        const reductionRatio = partialSurrenderValue / currentSurrender;
+        nRatio = nRatio * (1 - reductionRatio);
+      }
+      
+      cumPartialSurrender += partialSurrenderValue;
+    }
+    
+    // ✅ 所有值都基於 nRatio 計算（模擬 N 縮減的連動效果）
+    const survivalAfter = Math.round(row.survival * nRatio);
+    cumSurvivalAfter += survivalAfter;
+    const deathTotalAfter = Math.round(row.deathTotal * nRatio);
+    const surrenderTotalAfter = Math.round(row.surrenderTotal * nRatio);
+    
+    return {
+      ...row,
+      partialSurrenderValue,
+      cumPartialSurrender,
+      remainingRatio: nRatio,  // ✅ 使用累計 nRatio
+      survivalAfter,
+      cumSurvivalAfter,
+      deathTotalAfter,
+      surrenderTotalAfter,
+      annualPremiumAfter: row.annualPremium,
+      hasPartialSurrender: partialSurrenderValue > 0
+    };
+  });
+}
+
+function getMaxCoverageByAge(product, age) {
+  if (!product?.info?.coverageLimitsByAge) return product?.info?.maxCoverage || 200;
+  const limits = product.info.coverageLimitsByAge;
+  return limits[String(age)] || product.info.maxCoverage || 200;
+}
+
+function calculatePremium(gpRate, coverage, paymentMethod, isEmployee, productCode, payYears, discountInfo) {
+  const original = Math.round(gpRate * coverage * 10) / 10;
+  let basePremium = productCode.startsWith('PFV') ? Math.floor(original) : Math.round(original);
+  
+  let discount = 0;
+  
+  // ★★★ 高保額折扣：優先使用產品資料中的階梯表 ★★★
+  if (discountInfo?.highCoverageTiers?.length > 0) {
+    for (const tier of discountInfo.highCoverageTiers) {
+      if (coverage >= tier.minCoverage) {
+        discount += tier.discount;
+        break;
+      }
+    }
+  } else {
+    // 備用：硬編碼邏輯（舊版美金商品）
+    if (productCode.startsWith('PFW') || productCode.startsWith('PF5') || productCode.startsWith('PF6')) {
+      if (coverage >= 65) discount += 0.03;
+      else if (coverage >= 25) discount += 0.02;
+      else if (coverage >= 8) discount += 0.01;
+    } else if (productCode.startsWith('PFV')) {
+      if (payYears === 2) {
+        if (coverage >= 20) discount += 0.03;
+        else if (coverage >= 10) discount += 0.02;
+        else if (coverage >= 3) discount += 0.01;
+      } else {
+        if (coverage >= 30) discount += 0.03;
+        else if (coverage >= 15) discount += 0.02;
+        else if (coverage >= 5) discount += 0.01;
+      }
+    } else if (productCode.startsWith('PFD')) {
+      if (coverage >= 50) discount += 0.02;
+      else if (coverage >= 20) discount += 0.01;
+    } else if (productCode === 'PFC') {
+      if (payYears === 6) {
+        if (coverage >= 20) discount += 0.015;
+        else if (coverage >= 15) discount += 0.01;
+        else if (coverage >= 5) discount += 0.005;
+      } else if (payYears === 3) {
+        if (coverage >= 8) discount += 0.015;
+        else if (coverage >= 6) discount += 0.01;
+        else if (coverage >= 2) discount += 0.005;
+      }
+    }
+  }
+  
+  // ★★★ 繳費方式折扣：優先使用產品資料 ★★★
+  if (discountInfo?.paymentMethods?.[paymentMethod]) {
+    discount += discountInfo.paymentMethods[paymentMethod].first || 0;
+  } else if (paymentMethod === '金融機構轉帳') {
+    discount += 0.01;
+  }
+  
+  // 員工折扣
+  if (isEmployee) discount += (productCode.startsWith('PFW') || productCode.startsWith('PF5') || productCode.startsWith('PF6')) ? 0.08 : 0.01;
+  
+  // ★★★ 折扣上限：使用產品資料 ★★★
+  const maxDiscount = discountInfo?.maxDiscount || (isEmployee ? 0.11 : 0.04);
+  discount = Math.min(discount, maxDiscount);
+  
+  return { basePremium, actualPremium: Math.round(basePremium * (1 - discount)), discountRate: discount * 100 };
+}
+
+// ✅ v7.19 混合進位制 (Hybrid Rounding)
+// 【Gemini 建議修正】
+// 1. 保額計算（N, paidUpThisYear）→ Math.ceil（無條件進位）
+// 2. 現金計算（解約金組件）→ Math.round（四捨五入）
+// 3. 縮減順序：curN = (prevN + paidUpThisYear_Full) × K
+function calculateBenefits(key, coverage, payYears, rates, dividendLevel, premium, dividendMethod, storedInterestRate = 0.0265, partialSurrenders = [], currency = 'USD') {
+  const bonuSuffix = (dividendLevel === 'low' || dividendLevel === 'zero') ? '1' : '2';
+  const bonuKey = key + bonuSuffix;
+  const isZeroDividend = dividendLevel === 'zero';
+  
+  const cvRates = rates.cv?.[key] || [];
+  const dieRates = rates.die?.[key] || [];
+  const die2Rates = rates.die2?.[key] || [];
+  const srvRates = rates.srv?.[key] || [];
+  const pvfbRates = rates.pvfb?.[key] || [];
+  const pvfb0Rates = rates.pvfb0?.[key] || [];
+  const bonuRates = rates.bonu?.[bonuKey] || [];
+  const bonuDieRates = rates.bonudie?.[bonuKey] || rates.bonu_die?.[bonuKey] || [];
+  const bonuCvRates = rates.bonucv?.[bonuKey] || rates.bonu_cv?.[bonuKey] || [];
+  const paRates = rates.pa?.[key] || [];
+  
+  const isCashDividend = dividendMethod === '現金給付';
+  const isStoredInterest = dividendMethod === '儲存生息';
+  const isPaidUp = !isCashDividend && !isStoredInterest;
+  
+  const monthlyRate = storedInterestRate / 12;
+  const annualFactor = Math.pow(1 + monthlyRate, 12);
+  
+  const isUSD = currency === 'USD';
+  const rate = state.exchangeRate || 31.5;
+  
+  // 建立提領映射表（單位：TWD）
+  const surrenderMapTWD = {};
+  for (const s of (partialSurrenders || [])) {
+    for (let y = s.fromYear; y <= s.toYear; y++) {
+      const amountTWD = s.amountPerYear * 10000;
+      surrenderMapTWD[y] = (surrenderMapTWD[y] || 0) + amountTWD;
+    }
+  }
+  
+  const benefits = [];
+  let cumPremium = 0, cumSurvival = 0;
+  let cumStoredDividend = 0;
+  let cumPartialSurrenderTWD = 0;
+  
+  // 累計縮減因子
+  let cumulativeReductionFactor = 1.0;
+  
+  // 維護累計繳清保額
+  let reducedCumPaidUp = 0;
+  let prevReducedCumPaidUp = 0;
+  
+  // ✅ v7.19：記錄前一年末解約金（用於計算縮減比例）
+  let prevYearEndSurrenderTWD = 0;
+  
+  for (let year = 1; year <= 75; year++) {
+    const idx = year - 1;
+    const annualPremium = year <= payYears ? premium : 0;
+    cumPremium += annualPremium;
+    
+    const paRate = paRates[idx] || 0;
+    const reducedPaidUpAmount = paRate ? Math.ceil(paRate * coverage) : 0;
+    
+    // 取得當年提領金額
+    const withdrawalTWD = surrenderMapTWD[year] || 0;
+    
+    // ✅ v7.19：年初計算縮減比例
+    let reductionRatio = 0;
+    let thisYearK = 1;  // 當年的保留比例
+    if (withdrawalTWD > 0 && prevYearEndSurrenderTWD > 0) {
+      reductionRatio = withdrawalTWD / prevYearEndSurrenderTWD;
+      thisYearK = 1 - reductionRatio;
+    }
+    
+    // ====== 步驟 1：計算當年值 ======
+    // ✅ v7.19：紅利是基於前一年的貢獻，不受當年縮減影響
+    
+    // 計算當年紅利 K（用累計因子，但不乘 thisYearK）
+    const bonuRate = isZeroDividend ? 0 : (bonuRates[idx] || 0);
+    let kBase = bonuRate ? Math.round(bonuRate * coverage * cumulativeReductionFactor) : 0;
+    
+    // ✅ v7.19：kAdded 基於前一年末的 prevReducedCumPaidUp，不受當年縮減影響
+    let kAdded = 0;
+    if (isPaidUp && prevReducedCumPaidUp && bonuRate) {
+      kAdded = Math.round(prevReducedCumPaidUp * bonuRate / 10000);
+    }
+    const annualDividendK = kBase + kAdded;
+    
+    if (isStoredInterest) {
+      if (year === 1) {
+        cumStoredDividend = kBase;
+      } else {
+        cumStoredDividend = Math.round(cumStoredDividend * annualFactor + kBase);
+      }
+    }
+    
+    // 計算當年繳清保額 M - ✅ v7.19：用 Math.ceil（保額計算）
+    let paidUpThisYear = 0;
+    if (isPaidUp) {
+      const pvfbNext = pvfbRates[year] || 0;
+      paidUpThisYear = (annualDividendK > 0 && pvfbNext > 0) ? Math.ceil(annualDividendK / pvfbNext * 10000) : 0;
+    }
+    
+    // ✅ v7.19：curN 用 Math.ceil（保額計算）
+    // curN = (prevN + paidUpThisYear_Full) × K
+    let tempReducedCumPaidUp = Math.ceil((prevReducedCumPaidUp + paidUpThisYear) * thisYearK);
+    
+    // 計算生存金（當年提領時，基本保額組件也要縮減）
+    const srvRate = srvRates[idx] || 0;
+    const survivalF = srvRate ? Math.round(srvRate * coverage * cumulativeReductionFactor * thisYearK) : 0;
+    const survivalO = (isPaidUp && srvRate && tempReducedCumPaidUp) ? Math.round(srvRate * tempReducedCumPaidUp / 10000) : 0;
+    
+    let survival;
+    if (isCashDividend) {
+      survival = survivalF + kBase;
+    } else if (isStoredInterest) {
+      survival = survivalF;
+    } else {
+      survival = survivalF + survivalO;
+    }
+    
+    // 計算身故金 - 當年提領時，基本保額組件也要縮減
+    const dieRate = dieRates[idx] || 0;
+    const deathA = dieRate ? Math.round(dieRate * coverage * cumulativeReductionFactor * thisYearK) : 0;
+    const die2Rate = die2Rates[idx] || 0;
+    const deathD = (isPaidUp && tempReducedCumPaidUp && die2Rate) ? Math.round(tempReducedCumPaidUp * die2Rate / 10000) : 0;
+    const bonuDieRate = isZeroDividend ? 0 : (bonuDieRates[idx] || 0);
+    const deathX = bonuDieRate ? Math.round(bonuDieRate * coverage * cumulativeReductionFactor * thisYearK) : 0;
+    
+    let deathTotalNoWithdraw;
+    if (isCashDividend) {
+      deathTotalNoWithdraw = deathA + kBase + deathX;
+    } else if (isStoredInterest) {
+      deathTotalNoWithdraw = deathA + cumStoredDividend + deathX;
+    } else {
+      deathTotalNoWithdraw = deathA + deathD + deathX;
+    }
+    
+    // 計算解約金 - 當年提領時，基本保額組件也要縮減
+    const cvRate = cvRates[idx] || 0;
+    const surrenderB = cvRate ? Math.round(cvRate * coverage * cumulativeReductionFactor * thisYearK) : 0;
+    const pvfb0Next = pvfb0Rates[year] || 0;
+    const surrenderE = (isPaidUp && tempReducedCumPaidUp && pvfb0Next) ? Math.round(tempReducedCumPaidUp * pvfb0Next / 10000) : 0;
+    const bonuCvRate = isZeroDividend ? 0 : (bonuCvRates[idx] || 0);
+    const surrenderY = bonuCvRate ? Math.round(bonuCvRate * coverage * cumulativeReductionFactor * thisYearK) : 0;
+    
+    // ✅ v7.19：解約金已經是縮減後的值
+    let surrenderTotal;
+    if (isCashDividend) {
+      surrenderTotal = surrenderB + kBase + surrenderY;
+    } else if (isStoredInterest) {
+      surrenderTotal = surrenderB + cumStoredDividend + surrenderY;
+    } else {
+      surrenderTotal = surrenderB + surrenderE + surrenderY;
+    }
+    
+    // 轉成 TWD
+    let surrenderTotalTWD = isUSD ? Math.round(surrenderTotal * rate) : surrenderTotal;
+    let deathTotalTWD = isUSD ? Math.round(deathTotalNoWithdraw * rate) : deathTotalNoWithdraw;
+    
+    // ====== 步驟 2：記錄提領金額（但不從解約金扣除）======
+    // ✅ v7.19：根據 Gemini 分析，解約金 = 縮減後剩餘保單價值
+    // 用戶領取的金額是「年初結算」，不從年末解約金扣除
+    let actualWithdrawalTWD = 0;
+    const beforeReductionCumPaidUp = tempReducedCumPaidUp;
+    
+    if (withdrawalTWD > 0) {
+      // 實際提領金額 = 前一年末解約金 × R（年初結算）
+      actualWithdrawalTWD = withdrawalTWD;
+      
+      // ✅ v7.19：解約金欄位顯示「縮減後剩餘保單價值」
+      // 不需要再減提領，因為提領是年初結算的
+      // surrenderTotalTWD 保持不變
+      
+      // 更新累計因子（用於下一年）
+      cumulativeReductionFactor *= thisYearK;
+      
+      cumPartialSurrenderTWD += actualWithdrawalTWD;
+    }
+    
+    // 更新 reducedCumPaidUp
+    reducedCumPaidUp = tempReducedCumPaidUp;
+    
+    cumSurvival += survival;
+    
+    // 轉回原幣
+    const deathTotalFinal = isUSD ? Math.round(deathTotalTWD / rate) : deathTotalTWD;
+    const surrenderTotalFinal = isUSD ? Math.round(surrenderTotalTWD / rate) : surrenderTotalTWD;
+    const withdrawalDisplayValue = isUSD ? Math.round(actualWithdrawalTWD / rate) : actualWithdrawalTWD;
+    const cumWithdrawalDisplayValue = isUSD ? Math.round(cumPartialSurrenderTWD / rate) : cumPartialSurrenderTWD;
+    
+    // 保存診斷值
+    benefits.push({ 
+      year, annualPremium, cumPremium, 
+      paRate, reducedPaidUpAmount,
+      survival, cumSurvival,
+      annualDividend: kBase,
+      deathTotal: deathTotalFinal,
+      surrenderTotal: surrenderTotalFinal,
+      partialSurrenderValue: withdrawalDisplayValue,
+      cumPartialSurrender: cumWithdrawalDisplayValue,
+      partialSurrenderTWD: actualWithdrawalTWD,
+      cumPartialSurrenderTWD: cumPartialSurrenderTWD,
+      cumPaidUp: reducedCumPaidUp,
+      hasPartialSurrender: actualWithdrawalTWD > 0,
+      reductionRatio,
+      cumulativeReductionFactor,
+      _debug: {
+        kBase, kAdded, annualDividendK,
+        paidUpThisYear,
+        prevReducedCumPaidUp,
+        beforeReductionCumPaidUp,
+        deathA, deathD, deathX,
+        surrenderB, surrenderE, surrenderY,
+        deathNoWithdraw: deathTotalNoWithdraw,
+        surrenderNoWithdraw: surrenderTotal,
+        deathTotalTWD,
+        surrenderTotalTWD,
+        // v7.19：無提領解約金TWD（用於診斷）
+        surrenderNoWithdrawTWD: surrenderTotalTWD,
+        prevYearEndSurrenderTWD,
+        thisYearK,
+      }
+    });
+    
+    // ✅ v7.19：更新前一年末解約金（提領後的值）
+    prevYearEndSurrenderTWD = surrenderTotalTWD;
+    prevReducedCumPaidUp = reducedCumPaidUp;
+  }
+  
+  return benefits;
+}
+
+async function loadProducts() {
+  state.loading = true; render();
+  try {
+    const snap = await db.ref('products').once('value');
+    const data = snap.val();
+    if (!data) throw new Error('資料庫為空');
+    for (const [code, prod] of Object.entries(data)) {
+      state.products[code] = { 
+        code, 
+        info: prod.info, 
+        plans: prod.plans,
+        dividendOptions: prod.info?.dividendOptions || ['繳清保險金額']
+      };
+    }
+    state.loading = false; state.error = null;
+  } catch (e) { state.loading = false; state.error = e.message; }
+  render();
+}
+
+async function loadRates(productCode) {
+  state.loading = true; render();
+  try {
+    const snap = await db.ref('products/' + productCode + '/rates').once('value');
+    state.rates = snap.val();
+    state.loading = false;
+  } catch (e) { state.loading = false; state.error = e.message; }
+  render();
+}
+
+function getInsuranceAge() {
+  const bd = state.form.birthDate;
+  if (!bd || bd.length < 7) return null;
+  
+  // 解析格式：YYYMMDD（如 1040101 或 0840101）
+  const padded = bd.padStart(7, '0');
+  const birthYear = parseInt(padded.substring(0, 3));
+  const birthMonth = parseInt(padded.substring(3, 5));
+  const birthDay = parseInt(padded.substring(5, 7));
+  
+  if (!birthYear || !birthMonth || !birthDay) return null;
+  if (birthMonth < 1 || birthMonth > 12 || birthDay < 1 || birthDay > 31) return null;
+  
+  // 轉換民國年為西元年
+  const birthDateWest = new Date(birthYear + 1911, birthMonth - 1, birthDay);
+  const today = new Date();
+  
+  // 計算足歲
+  let age = today.getFullYear() - birthDateWest.getFullYear();
+  const monthDiff = today.getMonth() - birthDateWest.getMonth();
+  const dayDiff = today.getDate() - birthDateWest.getDate();
+  
+  // 如果還沒過生日，減一歲
+  if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) {
+    age--;
+  }
+  
+  // 保險年齡計算：半年多一歲
+  // 計算距離下次生日的月數
+  let monthsToNextBirthday;
+  if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) {
+    monthsToNextBirthday = -monthDiff + (dayDiff < 0 ? -1 : 0);
+  } else {
+    monthsToNextBirthday = 12 - monthDiff + (dayDiff > 0 ? -1 : 0);
+  }
+  
+  // 如果距離下次生日不到6個月，保險年齡+1
+  if (monthsToNextBirthday <= 6) {
+    age++;
+  }
+  
+  return age;
+}
+
+// 計算保費換算保額（輸入台幣，自動換算）
+function calculateCoverageFromPremium() {
+  const targetTWD = parseFloat(state.form.targetPremiumTWD);
+  if (!targetTWD || targetTWD <= 0) return;
+  
+  const age = getInsuranceAge();
+  const plan = state.selectedPlan;
+  const prod = state.selectedProduct;
+  if (!age || !plan || !prod || !state.rates?.gp) return;
+  
+  const isUSD = prod.info?.currency === 'USD';
+  // 如果是美元商品，將台幣換算成美元
+  const targetPremium = isUSD ? (targetTWD / state.exchangeRate) : targetTWD;
+  
+  const genderCode = state.form.gender === '男' ? '01' : '02';
+  const key = plan.prefix + genderCode + age.toString().padStart(2, '0');
+  const gpRate = state.rates.gp[key];
+  if (!gpRate) return;
+  
+  // 反算保額
+  let estimatedCov = targetPremium / gpRate;
+  
+  // 迭代調整（考慮折扣）
+  for (let i = 0; i < 5; i++) {
+    const premiumInfo = calculatePremium(gpRate, estimatedCov, state.form.paymentMethod, state.form.employeeDiscount, prod.code, plan.payYears, prod.info.discounts);
+    const diff = targetPremium - premiumInfo.actualPremium;
+    if (Math.abs(diff) < 1) break;
+    estimatedCov += diff / gpRate;
+  }
+  
+  // 取整到小數點一位
+  estimatedCov = Math.round(estimatedCov * 10) / 10;
+  
+  // 檢查保額範圍
+  const minCov = prod.info.minCoverage;
+  const maxCov = getMaxCoverageByAge(prod, age);
+  estimatedCov = Math.max(minCov, Math.min(maxCov, estimatedCov));
+  
+  state.form.coverage = estimatedCov;
+  render();
+}
+
+function doCalculate() {
+  const age = getInsuranceAge(), cov = parseFloat(state.form.coverage) || 0, plan = state.selectedPlan, prod = state.selectedProduct;
+  if (!age || !cov || !plan || !state.rates) { state.error = '請完整填寫資料'; render(); return; }
+  if (age < plan.minAge || age > plan.maxAge) { state.error = '年齡不符合此方案 (' + plan.minAge + '~' + plan.maxAge + '歲)'; render(); return; }
+  
+  const minCov = prod.info.minCoverage;
+  const maxCov = getMaxCoverageByAge(prod, age);
+  if (cov < minCov || cov > maxCov) { state.error = '保額需在 ' + minCov + '~' + maxCov + ' 萬之間（' + age + '歲限制）'; render(); return; }
+  
+  const genderCode = state.form.gender === '男' ? '01' : '02';
+  const key = plan.prefix + genderCode + age.toString().padStart(2, '0');
+  
+  if (!state.rates.gp?.[key]) { state.error = '找不到費率 ' + key; render(); return; }
+  
+  const gpRate = state.rates.gp[key];
+  const premiumInfo = calculatePremium(gpRate, cov, state.form.paymentMethod, state.form.employeeDiscount, prod.code, plan.payYears, prod.info.discounts);
+  const storedInterestRate = prod.info?.storedInterestRate || 0.0265;
+  const currency = prod.info.currency || 'TWD';
+  
+  // ✅ v7.2: 傳入部分提領設定，讓 N 在計算過程中縮減
+  const partialSurrenders = state.partialSurrenderMode ? state.partialSurrenders : [];
+  const benefits = calculateBenefits(key, cov, plan.payYears, state.rates, state.form.dividendLevel, premiumInfo.actualPremium, state.form.dividendMethod, storedInterestRate, partialSurrenders, currency);
+  
+  state.result = {
+    key, product: prod, plan, age, coverage: cov,
+    name: state.form.name || '客戶', gender: state.form.gender, 
+    dividendLevel: state.form.dividendLevel,
+    dividendMethod: state.form.dividendMethod,  // 紅利給付方式
+    basePremium: premiumInfo.basePremium, actualPremium: premiumInfo.actualPremium, discountRate: premiumInfo.discountRate,
+    benefits, currency: prod.info.currency || 'TWD'
+  };
+  state.error = null; state.step = 3; render();
+}
+
+// 結果頁快速更新（修改後自動重新計算）
+function quickUpdate(field, value) {
+  state.form[field] = field === 'coverage' ? parseFloat(value) : (field === 'birthYear' ? parseInt(value) : value);
+  doCalculate();
+}
+
+function formatCurrency(value, currency, year = null) {
+  if (value === null || value === undefined) return '-';
+  if (currency === 'USD' && state.showTWD) {
+    const rate = year ? getExchangeRate(year) : state.exchangeRate;
+    return Math.round(value * rate).toLocaleString();
+  }
+  return value.toLocaleString();
+}
+
+function render() {
+  const app = document.getElementById('app');
+  if (state.loading) { app.innerHTML = '<div class="min-h-screen flex items-center justify-center"><div class="spinner mx-auto"></div></div>'; return; }
+  if (state.error && state.step === 1) { app.innerHTML = '<div class="min-h-screen flex items-center justify-center p-4"><div class="glass rounded-2xl p-8 text-center"><p class="text-red-300 mb-4">' + state.error + '</p><button onclick="loadProducts()" class="px-6 py-2 bg-blue-500 text-white rounded-lg">重試</button></div></div>'; return; }
+  let c = '';
+  if (state.step === 1) c = renderStep1();
+  else if (state.step === 2) c = renderStep2();
+  else if (state.step === 3) c = renderStep3();
+  app.innerHTML = '<div class="bg-black/20 p-4 no-print"><h1 class="text-xl font-bold text-white text-center">保險商品試算系統 <span class="text-sm text-blue-300">v7</span> <span class="text-xs text-orange-300">含部分解約</span></h1></div><div class="p-4">' + c + '</div>';
+}
+
+function renderStep1() {
+  const prods = Object.values(state.products);
+  const keyword = state.searchKeyword;
+  
+  // 篩選商品
+  const filteredProds = keyword ? prods.filter(p => {
+    const searchText = (p.info.name + ' ' + p.code + ' ' + (p.info.fullName || '')).toLowerCase();
+    return searchText.includes(keyword);
+  }) : prods;
+  
+  const twdProds = filteredProds.filter(p => p.info.currency !== 'USD');
+  const usdProds = filteredProds.filter(p => p.info.currency === 'USD');
+  const hasUSD = prods.some(p => p.info.currency === 'USD');
+  
+  let html = '<div class="max-w-4xl mx-auto"><h2 class="text-2xl font-bold text-white text-center mb-6">選擇商品</h2>';
+  
+  // 匯率設定區（只有美元商品時顯示）
+  if (hasUSD) {
+    html += '<div class="glass rounded-xl p-4 mb-6">';
+    html += '<div class="flex items-center justify-between flex-wrap gap-4">';
+    html += '<div class="flex items-center gap-4">';
+    html += '<span class="text-blue-200">💱 匯率設定</span>';
+    html += '<label class="flex items-center gap-1"><input type="radio" name="rateMode" value="fixed" ' + (state.exchangeRateMode === 'fixed' ? 'checked' : '') + ' onchange="setExchangeRateMode(\'fixed\')"/><span class="text-white text-sm">固定匯率</span></label>';
+    html += '<label class="flex items-center gap-1"><input type="radio" name="rateMode" value="yearly" ' + (state.exchangeRateMode === 'yearly' ? 'checked' : '') + ' onchange="setExchangeRateMode(\'yearly\')"/><span class="text-white text-sm">逐年匯率</span></label>';
+    html += '</div>';
+    
+    if (state.exchangeRateMode === 'fixed') {
+      html += '<div class="flex items-center gap-2">';
+      html += '<span class="text-white text-sm">1 USD =</span>';
+      html += '<input type="number" value="' + state.exchangeRate + '" onchange="setExchangeRate(this.value)" step="0.1" class="w-20 px-2 py-1 bg-white/10 border border-white/20 rounded text-white text-sm text-center"/>';
+      html += '<span class="text-white text-sm">TWD</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+    
+    // 逐年匯率設定
+    if (state.exchangeRateMode === 'yearly') {
+      html += '<div class="mt-4 p-3 bg-white/5 rounded-lg">';
+      html += '<p class="text-sm text-blue-200 mb-2">設定各年度匯率（未設定年度使用固定匯率 ' + state.exchangeRate + '）</p>';
+      html += '<div class="grid grid-cols-5 md:grid-cols-10 gap-2">';
+      for (let y = 1; y <= 20; y++) {
+        const rate = state.yearlyRates[y] || state.exchangeRate;
+        html += '<div class="text-center">';
+        html += '<div class="text-xs text-white/50 mb-1">第' + y + '年</div>';
+        html += '<input type="number" value="' + rate + '" onchange="setYearlyRate(' + y + ',this.value)" step="0.1" class="w-full px-1 py-1 bg-white/10 border border-white/20 rounded text-white text-xs text-center"/>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+    html += '</div>';
+  }
+  
+  // 搜尋欄
+  html += '<div class="mb-6">';
+  html += '<input type="text" value="' + (state.searchKeyword || '') + '" oninput="setSearchKeyword(this.value)" placeholder="🔍 搜尋商品（中文/英文）" class="w-full px-4 py-3 bg-white/10 border border-white/20 rounded-xl text-white placeholder-white/50"/>';
+  html += '</div>';
+  
+  if (filteredProds.length === 0) {
+    html += '<p class="text-center text-white/50 py-8">找不到符合「' + keyword + '」的商品</p>';
+  }
+  
+  if (twdProds.length) {
+    html += '<h3 class="text-lg text-blue-200 mb-3">💴 台幣商品</h3><div class="grid md:grid-cols-2 gap-4 mb-6">';
+    html += twdProds.map(p => '<div onclick="selectProduct(\'' + p.code + '\')" class="glass rounded-xl p-5 cursor-pointer hover:bg-white/20"><h3 class="text-lg font-bold text-white">' + p.info.name + ' <span class="text-sm text-blue-300">' + p.code + '</span></h3><p class="text-blue-200 text-sm">' + (p.info.fullName || '') + '</p><p class="text-white/70 text-sm mt-2">保額：' + p.info.minCoverage + '~' + p.info.maxCoverage + ' 萬</p></div>').join('');
+    html += '</div>';
+  }
+  
+  if (usdProds.length) {
+    html += '<h3 class="text-lg text-blue-200 mb-3">💵 美元商品</h3><div class="grid md:grid-cols-2 gap-4">';
+    html += usdProds.map(p => '<div onclick="selectProduct(\'' + p.code + '\')" class="glass rounded-xl p-5 cursor-pointer hover:bg-white/20 border border-green-500/30"><h3 class="text-lg font-bold text-white">' + p.info.name + ' <span class="text-sm text-green-300">' + p.code + '</span></h3><p class="text-blue-200 text-sm">' + (p.info.fullName || '') + '</p><p class="text-white/70 text-sm mt-2">保額：' + p.info.minCoverage + '~' + p.info.maxCoverage + ' 萬 USD</p></div>').join('');
+    html += '</div>';
+  }
+  
+  html += '</div>';
+  return html;
+}
+
+function renderStep2() {
+  const prod = state.selectedProduct, plans = Object.entries(prod.plans), age = getInsuranceAge();
+  const maxCov = age ? getMaxCoverageByAge(prod, age) : prod.info.maxCoverage;
+  const isUSD = prod.info.currency === 'USD';
+  const dividendOptions = prod.info.dividendOptions || ['繳清保險金額'];
+  
+  let html = '<div class="max-w-3xl mx-auto"><button onclick="goStep(1)" class="text-blue-300 mb-4 no-print">← 返回</button>';
+  
+  // 匯率顯示（美元商品）
+  if (isUSD) {
+    html += '<div class="glass rounded-xl p-3 mb-4 flex items-center gap-4 flex-wrap">';
+    html += '<span class="text-sm text-blue-200">💱 匯率：</span>';
+    if (state.exchangeRateMode === 'fixed') {
+      html += '<span class="text-white">固定 1 USD = <input type="number" value="' + state.exchangeRate + '" onchange="setExchangeRate(this.value)" step="0.1" class="w-16 px-1 py-0.5 bg-white/10 border border-white/20 rounded text-white text-sm text-center"/> TWD</span>';
+    } else {
+      html += '<span class="text-white">逐年匯率</span>';
+      html += '<button onclick="goStep(1)" class="text-xs text-blue-300 underline">修改設定</button>';
+    }
+    html += '</div>';
+  }
+  
+  html += '<div class="glass rounded-xl p-6">';
+  html += '<h2 class="text-xl font-bold text-white mb-1">' + prod.info.name + '</h2>';
+  html += '<p class="text-sm text-blue-300 mb-4">' + prod.code + (isUSD ? ' 💵 美元計價' : ' 💴 台幣計價') + '</p>';
+  
+  html += '<div class="mb-4"><label class="text-blue-200 text-sm">方案</label><div class="grid grid-cols-' + Math.min(plans.length, 4) + ' gap-2 mt-1">';
+  for (const [code, plan] of plans) {
+    html += '<button onclick="selectPlan(\'' + code + '\')" class="p-2 rounded border ' + (state.selectedPlan?.code === code ? 'border-blue-400 bg-blue-500/20' : 'border-white/20') + '"><div class="text-white text-sm">' + plan.displayName + '</div><div class="text-xs text-blue-200">' + plan.minAge + '~' + plan.maxAge + '歲</div></button>';
+  }
+  html += '</div></div>';
+  
+  html += '<div class="grid md:grid-cols-2 gap-4">';
+  html += '<div><label class="text-blue-200 text-sm">姓名</label><input type="text" value="' + state.form.name + '" onchange="updateForm(\'name\',this.value)" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white"/></div>';
+  html += '<div><label class="text-blue-200 text-sm">性別</label><select onchange="updateForm(\'gender\',this.value)" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white"><option value="男"' + (state.form.gender === '男' ? ' selected' : '') + '>男</option><option value="女"' + (state.form.gender === '女' ? ' selected' : '') + '>女</option></select></div>';
+  
+  // 出生日期（單一欄位 YYYMMDD）
+  html += '<div><label class="text-blue-200 text-sm">出生日期（民國）</label>';
+  html += '<input type="text" value="' + state.form.birthDate + '" onchange="updateForm(\'birthDate\',this.value)" placeholder="1040101" maxlength="7" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white"/>';
+  html += (age ? '<p class="text-sm text-blue-300 mt-1">保險年齡：' + age + ' 歲</p>' : '<p class="text-sm text-blue-300/50 mt-1">格式：YYYMMDD（如 0840101）</p>') + '</div>';
+  
+  // 保額
+  html += '<div><label class="text-blue-200 text-sm">保額（萬 ' + (isUSD ? 'USD' : 'TWD') + '）</label><input type="number" value="' + state.form.coverage + '" onchange="updateForm(\'coverage\',this.value)" step="0.1" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white"/>';
+  html += '<p class="text-sm text-blue-300 mt-1">範圍：' + prod.info.minCoverage + ' ~ ' + maxCov + ' 萬</p></div>';
+  
+  // 保費換算保額（統一用台幣輸入）
+  html += '<div class="md:col-span-2"><label class="text-blue-200 text-sm">💡 保費換算保額</label>';
+  html += '<div class="flex gap-2 mt-1">';
+  html += '<div class="flex-1 relative"><input type="number" value="' + (state.form.targetPremiumTWD || '') + '" onchange="updateForm(\'targetPremiumTWD\',this.value)" placeholder="輸入目標年繳保費" class="w-full px-3 py-2 pr-16 bg-white/10 border border-white/20 rounded text-white"/><span class="absolute right-3 top-1/2 -translate-y-1/2 text-blue-300 text-sm">TWD</span></div>';
+  html += '<button onclick="calculateCoverageFromPremium()" class="px-4 py-2 bg-purple-500/50 border border-purple-400/50 rounded text-white text-sm hover:bg-purple-500/70 whitespace-nowrap">換算保額</button>';
+  html += '</div>';
+  if (isUSD) html += '<p class="text-sm text-purple-300/70 mt-1">將自動以匯率 ' + state.exchangeRate + ' 換算美元保額</p>';
+  html += '</div>';
+  
+  // 紅利給付方式（如果有多個選項）
+  if (dividendOptions.length > 1) {
+    html += '<div><label class="text-blue-200 text-sm">紅利給付方式</label><select onchange="updateForm(\'dividendMethod\',this.value)" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white">';
+    for (const opt of dividendOptions) {
+      html += '<option value="' + opt + '"' + (state.form.dividendMethod === opt ? ' selected' : '') + '>' + opt + '</option>';
+    }
+    html += '</select></div>';
+  }
+  
+  // 分紅假設選項（從商品資訊讀取，預設為 高/中/低）
+  const levelOptions = prod.info?.dividendLevelOptions || ['高分紅', '中分紅', '低分紅'];
+  const levelMapping = {'高分紅': 'high', '中分紅': 'medium', '低分紅': 'low', '最可能紅利': 'medium', '較低紅利': 'low', '可能紅利金額為0': 'zero'};
+  const reverseLevelMapping = {'high': '高分紅', 'medium': '中分紅', 'low': '低分紅', 'zero': '可能紅利金額為0'};
+  
+  html += '<div><label class="text-blue-200 text-sm">分紅假設</label><select onchange="updateForm(\'dividendLevel\',this.value)" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white">';
+  for (const opt of levelOptions) {
+    const val = levelMapping[opt] || 'medium';
+    html += '<option value="' + val + '"' + (state.form.dividendLevel === val ? ' selected' : '') + '>' + opt + '</option>';
+  }
+  html += '</select></div>';
+  
+  html += '<div><label class="text-blue-200 text-sm">繳費方式</label><select onchange="updateForm(\'paymentMethod\',this.value)" class="w-full mt-1 px-3 py-2 bg-white/10 border border-white/20 rounded text-white"><option value="金融機構轉帳">金融機構轉帳</option><option value="自行繳費">自行繳費</option></select></div>';
+  html += '<div class="flex items-center"><input type="checkbox" ' + (state.form.employeeDiscount ? 'checked' : '') + ' onchange="updateForm(\'employeeDiscount\',this.checked)"/><span class="ml-2 text-blue-200 text-sm">員工折扣</span></div>';
+  html += '</div>';
+  
+  // 顯示當前紅利給付方式（如果只有一個選項）
+  if (dividendOptions.length === 1) {
+    html += '<p class="text-sm text-blue-300 mt-4">紅利給付方式：' + dividendOptions[0] + '</p>';
+  }
+  
+  if (state.error) html += '<p class="text-red-300 mt-4">⚠️ ' + state.error + '</p>';
+  html += '<button onclick="doCalculate()" class="w-full mt-6 py-3 bg-blue-500 text-white rounded-xl font-semibold hover:bg-blue-600">立即試算</button>';
+  html += '</div></div>';
+  return html;
+}
+
+function renderStep3() {
+  const r = state.result;
+  const levelTextMap = {'high': '高分紅', 'medium': '中分紅', 'low': '低分紅', 'zero': '可能紅利金額為0'};
+  const levelText = levelTextMap[r.dividendLevel] || '中分紅';
+  const isUSD = r.currency === 'USD';
+  const currLabel = isUSD ? 'USD' : 'TWD';
+  const displayCurr = (isUSD && state.showTWD) ? 'TWD' : currLabel;
+  const dividendMethodText = r.dividendMethod || '繳清保險金額';
+  
+  // 找出可減額繳清的年度 (PA > 0 的年度)
+  const availableReduceYears = r.benefits.filter(b => b.paRate > 0).map(b => b.year);
+  
+  // 計算減額繳清比例
+  let reduceRatio = 1;
+  let reduceYear = state.reducedPaidUpYear;
+  if (reduceYear > 0 && reduceYear <= availableReduceYears.length) {
+    const paRate = r.benefits[reduceYear - 1].paRate;
+    reduceRatio = paRate / 10000;
+  } else {
+    reduceYear = 0;
+  }
+  
+  // 處理顯示資料
+  // 減額繳清在「年度末」執行，效果從「下一年度」開始
+  const data = r.benefits.slice(0, state.displayYears).map((row, idx) => {
+    const year = row.year;
+    // 減額繳清年度當年：正常顯示（還沒減額）
+    // 減額繳清年度的下一年起：所有數值乘以比例
+    if (reduceYear > 0 && year > reduceYear) {
+      return {
+        ...row,
+        annualPremium: 0,  // 減額繳清後不再繳費
+        cumPremium: r.benefits[reduceYear - 1].cumPremium,  // 累計保費停在減額年
+        survival: Math.round(row.survival * reduceRatio),
+        cumSurvival: Math.round(row.cumSurvival * reduceRatio),
+        deathTotal: Math.round(row.deathTotal * reduceRatio),
+        surrenderTotal: Math.round(row.surrenderTotal * reduceRatio),
+        isReduced: true
+      };
+    }
+    return { ...row, isReduced: false };
+  });
+  
+  let html = '<div class="max-w-7xl mx-auto"><button onclick="goStep(2)" class="text-blue-300 mb-4 no-print">← 返回修改</button>';
+  
+  // 匯率設定（美元商品）
+  if (isUSD) {
+    html += '<div class="glass rounded-xl p-3 mb-4 no-print">';
+    html += '<div class="flex items-center gap-4 flex-wrap">';
+    html += '<span class="text-sm text-blue-200">💱 匯率：</span>';
+    
+    if (state.exchangeRateMode === 'fixed') {
+      html += '<span class="text-white text-sm">固定 1 USD =</span>';
+      html += '<input type="number" value="' + state.exchangeRate + '" onchange="setExchangeRate(this.value)" step="0.1" class="w-20 px-2 py-1 bg-white/10 border border-white/20 rounded text-white text-sm text-center"/> TWD';
+    } else {
+      html += '<span class="text-white text-sm">逐年匯率</span>';
+      html += '<button onclick="goStep(1)" class="text-xs text-blue-300 underline ml-2">修改設定</button>';
+    }
+    
+    html += '<label class="flex items-center ml-4"><input type="checkbox" ' + (state.showTWD ? 'checked' : '') + ' onchange="toggleShowTWD(this.checked)"/><span class="ml-2 text-blue-200 text-sm">顯示台幣換算</span></label>';
+    html += '</div>';
+    
+    // 逐年匯率快速預覽
+    if (state.exchangeRateMode === 'yearly' && state.showTWD) {
+      html += '<div class="mt-2 text-xs text-white/50">匯率：';
+      for (let y = 1; y <= Math.min(10, state.displayYears); y++) {
+        html += '第' + y + '年=' + getExchangeRate(y) + (y < 10 ? ', ' : '...');
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  
+  // 減額繳清設定
+  if (availableReduceYears.length > 0) {
+    html += '<div class="glass rounded-xl p-3 mb-4 no-print">';
+    html += '<div class="flex items-center gap-4 flex-wrap">';
+    html += '<span class="text-sm text-purple-300">📋 減額繳清試算：</span>';
+    html += '<select onchange="setReducedPaidUpYear(this.value)" class="px-3 py-1 bg-white/10 border border-white/20 rounded text-white text-sm">';
+    html += '<option value="0"' + (reduceYear === 0 ? ' selected' : '') + '>不使用減額繳清</option>';
+    for (const y of availableReduceYears) {
+      const pa = r.benefits[y - 1].paRate;
+      const ratio = (pa / 100).toFixed(2);
+      html += '<option value="' + y + '"' + (reduceYear === y ? ' selected' : '') + '>第 ' + y + ' 年末減額（' + ratio + '%）</option>';
+    }
+    html += '</select>';
+    if (reduceYear > 0) {
+      const reducedAmount = r.benefits[reduceYear - 1].reducedPaidUpAmount;
+      html += '<span class="text-purple-200 text-sm">減額繳清保額：<strong class="text-purple-300">' + formatCurrency(reducedAmount, r.currency) + '</strong></span>';
+    }
+    html += '</div></div>';
+  }
+  
+  // 🆕 部分解約設定
+  html += '<div class="glass rounded-xl p-3 mb-4 no-print">';
+  html += '<div class="flex items-center gap-4 flex-wrap mb-2">';
+  html += '<label class="flex items-center"><input type="checkbox" ' + (state.partialSurrenderMode ? 'checked' : '') + ' onchange="togglePartialSurrenderMode(this.checked)"/><span class="ml-2 text-orange-300 text-sm font-semibold">💸 部分解約試算</span></label>';
+  if (state.partialSurrenderMode) {
+    html += '<button onclick="addPartialSurrender()" class="px-2 py-1 bg-orange-500 text-white rounded text-xs hover:bg-orange-600">+ 新增區間</button>';
+  }
+  html += '</div>';
+  
+  if (state.partialSurrenderMode) {
+    const rate = state.exchangeRate;
+    if (state.partialSurrenders.length === 0) {
+      html += '<p class="text-white/50 text-sm">尚未設定部分解約，點擊「新增區間」開始設定</p>';
+    } else {
+      html += '<div class="space-y-2">';
+      for (let i = 0; i < state.partialSurrenders.length; i++) {
+        const s = state.partialSurrenders[i];
+        const fromAge = r.age + s.fromYear - 1;
+        const toAge = r.age + s.toYear - 1;
+        html += '<div class="flex items-center gap-2 p-2 bg-orange-500/10 rounded flex-wrap">';
+        html += '<span class="text-white text-sm">第</span>';
+        html += '<input type="number" value="' + s.fromYear + '" onchange="updatePartialSurrender(' + i + ',\'fromYear\',this.value)" min="1" max="75" class="w-14 px-2 py-1 bg-white/10 border border-white/20 rounded text-white text-center text-sm"/>';
+        html += '<span class="text-white text-sm">~</span>';
+        html += '<input type="number" value="' + s.toYear + '" onchange="updatePartialSurrender(' + i + ',\'toYear\',this.value)" min="1" max="75" class="w-14 px-2 py-1 bg-white/10 border border-white/20 rounded text-white text-center text-sm"/>';
+        html += '<span class="text-white text-sm">年</span>';
+        html += '<span class="text-white/50 text-xs">(' + fromAge + '~' + toAge + '歲)</span>';
+        html += '<span class="text-white text-sm">每年解約</span>';
+        html += '<input type="number" value="' + s.amountPerYear + '" onchange="updatePartialSurrender(' + i + ',\'amountPerYear\',this.value)" min="1" class="w-20 px-2 py-1 bg-white/10 border border-white/20 rounded text-white text-center text-sm"/>';
+        // ✅ v7.4: 提領單位固定為「萬 TWD」（工廠的邏輯）
+        html += '<span class="text-white text-sm">萬TWD</span>';
+        html += '<button onclick="removePartialSurrender(' + i + ')" class="px-2 py-1 bg-red-500/50 text-white rounded text-xs hover:bg-red-500">✕</button>';
+        // 計算小計
+        const totalYears = Math.max(0, s.toYear - s.fromYear + 1);
+        const totalAmount = totalYears * s.amountPerYear;
+        // ✅ v7.4: 固定顯示 TWD，並換算 USD（如果是 USD 商品）
+        html += '<span class="text-orange-300 text-xs ml-2">= ' + totalYears + '年 × ' + s.amountPerYear + '萬 = ' + totalAmount + '萬 TWD';
+        if (isUSD) {
+          const amountUSD = (s.amountPerYear / rate).toFixed(2);
+          const totalUSD = (totalAmount / rate).toFixed(2);
+          html += ' ≈ ' + totalUSD + '萬 USD';
+        }
+        html += '</span>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+  
+  html += '<div class="grid grid-cols-2 md:grid-cols-7 gap-3 mb-4">';
+  
+  // 被保險人卡片（性別可選、出生日期可編輯）
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">被保險人</p>';
+  html += '<p class="font-bold text-white">' + r.name + '</p>';
+  html += '<div class="flex items-center gap-1 mt-1">';
+  html += '<select onchange="quickUpdate(\'gender\',this.value)" class="text-xs bg-white/10 border border-white/20 rounded px-1 py-0.5 text-white">';
+  html += '<option value="男"' + (r.gender === '男' ? ' selected' : '') + '>男</option>';
+  html += '<option value="女"' + (r.gender === '女' ? ' selected' : '') + '>女</option>';
+  html += '</select>';
+  html += '<span class="text-xs text-white/50">・</span>';
+  html += '<span class="text-xs text-blue-300">' + r.age + '歲</span>';
+  html += '</div>';
+  html += '<input type="text" value="' + state.form.birthDate + '" onchange="quickUpdate(\'birthDate\',this.value)" class="w-full mt-1 text-xs bg-white/10 border border-white/20 rounded px-1 py-0.5 text-white text-center" maxlength="7" placeholder="YYYMMDD"/>';
+  html += '</div>';
+  
+  // 險種卡片（不可編輯）
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">險種</p><p class="font-bold text-white">' + r.plan.displayName + '</p></div>';
+  
+  // 保額卡片（可編輯）
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">保額</p>';
+  html += '<div class="flex items-center gap-1">';
+  html += '<input type="number" value="' + r.coverage + '" onchange="quickUpdate(\'coverage\',this.value)" step="0.1" class="w-16 font-bold bg-white/10 border border-white/20 rounded px-2 py-0.5 text-white"/>';
+  html += '<span class="text-white text-sm">萬 ' + currLabel + '</span>';
+  html += '</div></div>';
+  
+  // 年繳保費（不可編輯）
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">年繳保費</p><p class="font-bold text-white">' + formatCurrency(r.basePremium, r.currency) + ' ' + displayCurr + '</p></div>';
+  
+  // 優惠後保費（不可編輯）
+  html += '<div class="glass rounded-xl p-3 bg-green-500/20"><p class="text-xs text-blue-200">優惠後保費</p><p class="font-bold text-green-300">' + formatCurrency(r.actualPremium, r.currency) + ' ' + displayCurr + '</p><p class="text-xs text-white/50">折扣 ' + r.discountRate.toFixed(1) + '%</p></div>';
+  
+  // 分紅假設卡片（下拉選單）
+  const levelOptions = r.product.info?.dividendLevelOptions || ['高分紅', '中分紅', '低分紅'];
+  const levelMapping = {'高分紅': 'high', '中分紅': 'medium', '低分紅': 'low', '可能紅利金額為0': 'zero'};
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">分紅假設</p>';
+  html += '<select onchange="quickUpdate(\'dividendLevel\',this.value)" class="w-full mt-1 font-bold bg-white/10 border border-white/20 rounded px-2 py-1 text-white text-sm">';
+  for (const opt of levelOptions) {
+    const val = levelMapping[opt] || 'medium';
+    html += '<option value="' + val + '"' + (r.dividendLevel === val ? ' selected' : '') + '>' + opt + '</option>';
+  }
+  html += '</select></div>';
+  
+  // 紅利給付卡片（若有多選項則下拉選單）
+  const dividendOpts = r.product.info?.dividendOptions || [dividendMethodText];
+  html += '<div class="glass rounded-xl p-3"><p class="text-xs text-blue-200">紅利給付</p>';
+  if (dividendOpts.length > 1) {
+    html += '<select onchange="quickUpdate(\'dividendMethod\',this.value)" class="w-full mt-1 font-bold bg-white/10 border border-white/20 rounded px-2 py-1 text-yellow-300 text-sm">';
+    for (const opt of dividendOpts) {
+      html += '<option value="' + opt + '"' + (r.dividendMethod === opt ? ' selected' : '') + '>' + opt + '</option>';
+    }
+    html += '</select>';
+  } else {
+    html += '<p class="font-bold text-yellow-300 text-sm mt-1">' + dividendMethodText + '</p>';
+  }
+  html += '</div>';
+  
+  html += '</div>';
+  
+  html += '<div class="glass rounded-xl p-3 mb-4 no-print"><span class="text-sm text-blue-200">顯示年數：</span><select onchange="setDisplayYears(this.value)" class="ml-2 px-3 py-1 bg-white/10 border border-white/20 rounded text-white text-sm">';
+  [10, 20, 30, 50, 75].forEach(n => { html += '<option value="' + n + '"' + (state.displayYears === n ? ' selected' : '') + '>前' + n + '年</option>'; });
+  html += '</select></div>';
+  
+  // 根據是否啟用部分解約選擇不同表格
+  if (state.partialSurrenderMode && state.partialSurrenders.length > 0 && reduceYear === 0) {
+    html += renderPartialSurrenderTable(r, data, isUSD, levelText, dividendMethodText);
+  } else {
+    const tableTitle = reduceYear > 0 ? '減額繳清試算表（第 ' + reduceYear + ' 年末減額，第 ' + (reduceYear + 1) + ' 年起按 ' + (reduceRatio * 100).toFixed(2) + '% 計算）' : '分紅保單投保利益彙總表';
+    
+    let rateNote = '';
+    if (isUSD && state.showTWD) {
+      rateNote = state.exchangeRateMode === 'fixed' 
+        ? '（台幣換算，固定匯率 ' + state.exchangeRate + '）' 
+        : '（台幣換算，逐年匯率）';
+    }
+    
+    html += '<div class="glass rounded-xl overflow-hidden"><div class="p-4 border-b border-white/10"><h3 class="font-bold text-white">' + tableTitle + '</h3><p class="text-sm text-blue-200">假設分紅：' + levelText + '；紅利給付方式：' + dividendMethodText + rateNote + '</p></div>';
+    html += '<div class="table-scroll"><table class="w-full text-sm"><thead class="sticky-header"><tr>';
+    html += '<th class="px-2 py-2 text-left text-blue-200">年度</th>';
+    html += '<th class="px-2 py-2 text-left text-blue-200">年齡</th>';
+    html += '<th class="px-2 py-2 text-right text-blue-200">年繳保費</th>';
+    html += '<th class="px-2 py-2 text-right text-blue-200">累計保費</th>';
+    if (reduceYear === 0) html += '<th class="px-2 py-2 text-right text-purple-300">減額繳清</th>';
+    html += '<th class="px-2 py-2 text-right text-yellow-300">生存金</th>';
+    html += '<th class="px-2 py-2 text-right text-yellow-300">累計生存</th>';
+    html += '<th class="px-2 py-2 text-right text-green-300">身故總額</th>';
+    html += '<th class="px-2 py-2 text-right text-blue-300">解約總額</th>';
+    html += '</tr></thead><tbody>';
+    
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i], isPayYear = row.annualPremium > 0, hasSurv = row.survival > 0;
+      const isReducePoint = reduceYear > 0 && row.year === reduceYear;
+      const isYear5n = row.year % 5 === 0;
+      let rowClass = isYear5n ? 'year-5n' : (i % 2 ? 'bg-white/5' : '');
+      if (isPayYear) rowClass += ' font-semibold';
+      if (hasSurv && !isYear5n) rowClass += ' bg-green-500/10';
+      if (isReducePoint) rowClass = 'bg-purple-500/20 font-bold';
+      else if (row.isReduced && !isYear5n) rowClass += ' bg-purple-500/5';
+      
+      html += '<tr class="' + rowClass + '">';
+      html += '<td class="px-2 py-1.5 text-white">' + row.year + (isReducePoint ? ' 📋' : '') + '</td>';
+      html += '<td class="px-2 py-1.5 text-white">' + (r.age + row.year - 1) + '</td>';
+      html += '<td class="px-2 py-1.5 text-right text-white">' + (row.annualPremium ? formatCurrency(row.annualPremium, r.currency, row.year) : '') + '</td>';
+      html += '<td class="px-2 py-1.5 text-right text-white">' + formatCurrency(row.cumPremium, r.currency, row.year) + '</td>';
+      if (reduceYear === 0) {
+        const hasPA = row.paRate > 0;
+        html += '<td class="px-2 py-1.5 text-right ' + (hasPA ? 'text-purple-300' : 'text-white/30') + '">' + (hasPA ? formatCurrency(row.reducedPaidUpAmount, r.currency, row.year) : '-') + '</td>';
+      }
+      html += '<td class="px-2 py-1.5 text-right text-yellow-300">' + (row.survival ? formatCurrency(row.survival, r.currency, row.year) : '') + '</td>';
+      html += '<td class="px-2 py-1.5 text-right text-yellow-300">' + (row.cumSurvival ? formatCurrency(row.cumSurvival, r.currency, row.year) : '') + '</td>';
+      html += '<td class="px-2 py-1.5 text-right text-green-300">' + formatCurrency(row.deathTotal, r.currency, row.year) + '</td>';
+      html += '<td class="px-2 py-1.5 text-right text-blue-300">' + formatCurrency(row.surrenderTotal, r.currency, row.year) + '</td>';
+      html += '</tr>';
+    }
+    html += '</tbody></table></div></div>';
+    
+    // 說明
+    if (reduceYear === 0) {
+      html += '<div class="glass rounded-xl p-4 mt-4 text-sm">';
+      html += '<p class="text-purple-300 font-semibold mb-2">💡 減額繳清說明</p>';
+      html += '<p class="text-blue-200">減額繳清保額欄位顯示在各年度末可執行減額繳清時的保額。</p>';
+      html += '<p class="text-white/60 mt-1">選擇「減額繳清試算」後，可查看減額繳清後各年度的預估數值。</p>';
+      html += '</div>';
+    } else {
+      html += '<div class="glass rounded-xl p-4 mt-4 text-sm bg-purple-500/10">';
+      html += '<p class="text-purple-300 font-semibold mb-2">📋 減額繳清試算說明</p>';
+      html += '<p class="text-blue-200">第 ' + reduceYear + ' 年末執行減額繳清：</p>';
+      html += '<ul class="text-white/70 mt-1 list-disc list-inside">';
+      html += '<li>第 ' + reduceYear + ' 年正常繳費、正常給付</li>';
+      html += '<li>第 ' + (reduceYear + 1) + ' 年起不再繳費</li>';
+      html += '<li>第 ' + (reduceYear + 1) + ' 年起的生存金、身故、解約金皆按 <strong class="text-purple-300">' + (reduceRatio * 100).toFixed(2) + '%</strong> 比例計算</li>';
+      html += '</ul>';
+      html += '</div>';
+    }
+  }
+  
+  // 紅利給付方式說明
+  if (dividendMethodText !== '繳清保險金額') {
+    html += '<div class="glass rounded-xl p-4 mt-4 text-sm bg-yellow-500/10">';
+    html += '<p class="text-yellow-300 font-semibold mb-2">⚠️ 紅利給付方式說明</p>';
+    html += '<p class="text-blue-200">您選擇的紅利給付方式為「' + dividendMethodText + '」。</p>';
+    if (dividendMethodText === '現金給付') {
+      html += '<p class="text-white/60 mt-1">現金給付模式下，年度紅利會加入生存金欄位一起顯示。目前計算引擎以「繳清保險金額」為基礎，實際數值請以公版試算表為準。</p>';
+    } else if (dividendMethodText === '儲存生息') {
+      html += '<p class="text-white/60 mt-1">儲存生息模式下，紅利會累積生息。目前計算引擎以「繳清保險金額」為基礎，實際數值請以公版試算表為準。</p>';
+    } else {
+      html += '<p class="text-white/60 mt-1">目前計算引擎以「繳清保險金額」為基礎計算，實際數值請以公版試算表為準。</p>';
+    }
+    html += '</div>';
+  }
+  
+  html += '<div class="flex justify-center gap-4 mt-6 no-print"><button onclick="goStep(1)" class="px-6 py-3 border-2 border-blue-400 text-blue-300 rounded-xl">重新試算</button><button onclick="openDMDesigner()" class="px-6 py-3 bg-amber-500 text-white rounded-xl font-bold">📄 生成 DM</button><button onclick="window.print()" class="px-6 py-3 bg-blue-500 text-white rounded-xl">列印</button></div>';
+  html += '</div>';
+  return html;
+}
+
+function selectProduct(code) { 
+  state.selectedProduct = state.products[code]; 
+  const plans = Object.entries(state.selectedProduct.plans); 
+  state.selectedPlan = { code: plans[0][0], ...plans[0][1] }; 
+  state.error = null; 
+  state.step = 2; 
+  state.reducedPaidUpYear = 0;
+  // 設定預設紅利給付方式（第一個選項）
+  const dividendOptions = state.selectedProduct.info?.dividendOptions || ['繳清保險金額'];
+  state.form.dividendMethod = dividendOptions[0];
+  loadRates(code); 
+}
+function selectPlan(code) { state.selectedPlan = { code, ...state.selectedProduct.plans[code] }; state.error = null; render(); }
+function updateForm(key, value) { state.form[key] = value; state.error = null; render(); }
+function goStep(n) { state.step = n; state.error = null; if (n !== 3) state.reducedPaidUpYear = 0; render(); }
+function setDisplayYears(n) { state.displayYears = parseInt(n); render(); }
+function setExchangeRate(v) { state.exchangeRate = parseFloat(v) || 32.5; render(); }
+function toggleShowTWD(v) { state.showTWD = v; render(); }
+function setReducedPaidUpYear(y) { state.reducedPaidUpYear = parseInt(y) || 0; render(); }
+
+// 🆕 v7.28: 打開 DM Designer
+function openDMDesigner() {
+  const r = state.result;
+  if (!r) return;
+  
+  const params = new URLSearchParams();
+  params.set('product', state.selectedProduct.code);
+  params.set('plan', state.selectedPlan.code);
+  params.set('age', r.age);
+  params.set('gender', r.gender === '男' ? 'male' : 'female');
+  params.set('coverage', r.coverage);
+  params.set('queryAge', r.age + 30); // 預設查詢 30 年後
+  
+  window.open('dm-designer.html?' + params.toString(), '_blank');
+}
+
+// 🆕 部分解約表格渲染
+function renderPartialSurrenderTable(r, originalData, isUSD, levelText, dividendMethodText) {
+  // ✅ v7.2: benefits 已經包含部分提領處理過的數據，直接使用
+  // 不再需要調用 calculateWithPartialSurrender
+  const data = originalData.slice(0, state.displayYears);
+  const rate = state.exchangeRate;
+  
+  let rateNote = '';
+  if (isUSD && state.showTWD) {
+    rateNote = state.exchangeRateMode === 'fixed' 
+      ? '（台幣換算，固定匯率 ' + state.exchangeRate + '）' 
+      : '（台幣換算，逐年匯率）';
+  }
+  
+  // 統計（使用 TWD 提領金額）
+  let totalSurrenderValueTWD = 0;
+  for (const row of originalData) {
+    totalSurrenderValueTWD += row.partialSurrenderTWD || 0;
+  }
+  
+  let html = '<div class="glass rounded-xl overflow-hidden">';
+  html += '<div class="p-4 border-b border-white/10">';
+  html += '<h3 class="font-bold text-orange-300">💸 部分解約試算表 <span class="text-xs text-white/50">v7.19</span></h3>';
+  html += '<p class="text-sm text-blue-200">假設分紅：' + levelText + '；紅利給付方式：' + dividendMethodText + rateNote + '</p>';
+  html += '<p class="text-sm text-white/50">保額：' + r.coverage.toFixed(2) + ' 萬 ' + r.currency + '（提領單位：萬 TWD）</p>';
+  
+  // 解約摘要
+  html += '<div class="mt-2 p-2 bg-orange-500/10 rounded text-sm">';
+  html += '<span class="text-orange-300">設定：</span>';
+  for (const s of state.partialSurrenders) {
+    const fromAge = r.age + s.fromYear - 1;
+    const toAge = r.age + s.toYear - 1;
+    html += '<span class="text-white/70 ml-2">第' + s.fromYear + '~' + s.toYear + '年（' + fromAge + '~' + toAge + '歲）每年 ' + s.amountPerYear + ' 萬TWD';
+    if (isUSD) {
+      const amountUSD = (s.amountPerYear * 10000 / rate).toFixed(0);
+      html += ' ≈ ' + amountUSD + ' USD';
+    }
+    html += '</span>';
+  }
+  html += '</div>';
+  html += '<div class="mt-1 p-2 bg-orange-500/10 rounded text-sm">';
+  // ✅ v7.7: 顯示 TWD 和原幣兩種累計
+  html += '<span class="text-orange-300">累計提領：' + totalSurrenderValueTWD.toLocaleString() + ' TWD';
+  if (isUSD) {
+    html += ' ≈ ' + Math.round(totalSurrenderValueTWD / rate).toLocaleString() + ' USD';
+  }
+  html += '</span>';
+  html += '</div>';
+  html += '</div>';
+  
+  html += '<div class="table-scroll"><table class="w-full text-sm">';
+  html += '<thead class="sticky-header"><tr>';
+  html += '<th class="px-2 py-2 text-left text-blue-200">年度</th>';
+  html += '<th class="px-2 py-2 text-left text-blue-200">年齡</th>';
+  html += '<th class="px-2 py-2 text-right text-blue-200">年繳保費</th>';
+  html += '<th class="px-2 py-2 text-right text-orange-300">提領(TWD)</th>';
+  html += '<th class="px-2 py-2 text-right text-orange-200">累計(TWD)</th>';
+  html += '<th class="px-2 py-2 text-right text-yellow-300">生存金</th>';
+  html += '<th class="px-2 py-2 text-right text-yellow-300">累計領取</th>';
+  html += '<th class="px-2 py-2 text-right text-green-300">身故總額</th>';
+  html += '<th class="px-2 py-2 text-right text-blue-300">解約總額</th>';
+  html += '<th class="px-2 py-2 text-right text-purple-300">N(累計)</th>';
+  html += '<th class="px-2 py-2 text-right text-red-300">當年縮減</th>';
+  html += '<th class="px-2 py-2 text-right text-pink-300">累計因子</th>';
+  html += '</tr></thead><tbody>';
+  
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const hasSurrender = row.hasPartialSurrender;
+    const isYear5n = row.year % 5 === 0;
+    
+    let rowClass = hasSurrender ? 'partial-surrender-row' : (isYear5n ? 'year-5n' : (i % 2 ? 'bg-white/5' : ''));
+    if (row.annualPremium > 0) rowClass += ' font-semibold';
+    
+    // 累計領取 = 累計生存金 + 累計部份提領(原幣)
+    const cumReceived = (row.cumSurvival || 0) + (row.cumPartialSurrender || 0);
+    
+    html += '<tr class="' + rowClass + '">';
+    html += '<td class="px-2 py-1.5 text-white">' + row.year + (hasSurrender ? ' 💸' : '') + '</td>';
+    html += '<td class="px-2 py-1.5 text-white">' + (r.age + row.year - 1) + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-white">' + (row.annualPremium > 0 ? formatCurrency(row.annualPremium, r.currency, row.year) : '') + '</td>';
+    // v7.8: TWD 提領金額
+    html += '<td class="px-2 py-1.5 text-right text-orange-300 font-bold">' + (row.partialSurrenderTWD > 0 ? row.partialSurrenderTWD.toLocaleString() : '') + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-orange-200">' + (row.cumPartialSurrenderTWD > 0 ? row.cumPartialSurrenderTWD.toLocaleString() : '') + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-yellow-300">' + (row.survival > 0 ? formatCurrency(row.survival, r.currency, row.year) : '') + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-yellow-300">' + formatCurrency(cumReceived, r.currency, row.year) + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-green-300">' + formatCurrency(row.deathTotal, r.currency, row.year) + '</td>';
+    html += '<td class="px-2 py-1.5 text-right text-blue-300">' + formatCurrency(row.surrenderTotal, r.currency, row.year) + '</td>';
+    // v7.8: N（累計繳清保額）
+    html += '<td class="px-2 py-1.5 text-right text-purple-300 text-xs">' + (row.cumPaidUp || 0).toLocaleString() + '</td>';
+    // v7.8: 當年縮減比例
+    html += '<td class="px-2 py-1.5 text-right text-red-300 text-xs">' + (row.reductionRatio > 0 ? (row.reductionRatio * 100).toFixed(2) + '%' : '') + '</td>';
+    // v7.8: 累計縮減因子
+    html += '<td class="px-2 py-1.5 text-right text-pink-300 text-xs">' + (row.cumulativeReductionFactor < 1 ? (row.cumulativeReductionFactor * 100).toFixed(2) + '%' : '') + '</td>';
+    html += '</tr>';
+  }
+  
+  html += '</tbody></table></div></div>';
+  
+  // ✅ v7.19 診斷表格
+  html += '<div class="glass rounded-xl overflow-hidden mt-4">';
+  html += '<div class="p-4 border-b border-white/10">';
+  html += '<h3 class="font-bold text-red-400">🔍 診斷表（第9-13年中間值）<span class="text-xs text-white/50">v7.19</span></h3>';
+  html += '<p class="text-xs text-white/50">對比工廠數據找出差異來源</p>';
+  html += '</div>';
+  html += '<div class="table-scroll"><table class="w-full text-xs">';
+  html += '<thead class="sticky-header"><tr>';
+  html += '<th class="px-1 py-1 text-left text-blue-200">年</th>';
+  html += '<th class="px-1 py-1 text-right text-yellow-300">K(紅利)</th>';
+  html += '<th class="px-1 py-1 text-right text-purple-300">prevN</th>';
+  html += '<th class="px-1 py-1 text-right text-purple-300">curN</th>';
+  html += '<th class="px-1 py-1 text-right text-green-300">deathA</th>';
+  html += '<th class="px-1 py-1 text-right text-green-300">deathD</th>';
+  html += '<th class="px-1 py-1 text-right text-green-300">deathX</th>';
+  html += '<th class="px-1 py-1 text-right text-green-400">無提領死(USD)</th>';
+  html += '<th class="px-1 py-1 text-right text-blue-300">surrB</th>';
+  html += '<th class="px-1 py-1 text-right text-blue-300">surrE</th>';
+  html += '<th class="px-1 py-1 text-right text-blue-300">surrY</th>';
+  html += '<th class="px-1 py-1 text-right text-blue-400">無提領解(USD)</th>';
+  html += '<th class="px-1 py-1 text-right text-orange-300">無提領解(TWD)</th>';
+  html += '<th class="px-1 py-1 text-right text-red-300">縮減%</th>';
+  html += '<th class="px-1 py-1 text-right text-pink-300">累計因子</th>';
+  html += '</tr></thead><tbody>';
+  
+  // 只顯示第9-20年
+  for (let i = 8; i < Math.min(20, data.length); i++) {
+    const row = data[i];
+    const d = row._debug || {};
+    const hasSurrender = row.hasPartialSurrender;
+    let rowClass = hasSurrender ? 'bg-orange-500/20' : (i % 2 ? 'bg-white/5' : '');
+    
+    html += '<tr class="' + rowClass + '">';
+    html += '<td class="px-1 py-1 text-white font-bold">' + row.year + '</td>';
+    html += '<td class="px-1 py-1 text-right text-yellow-300">' + (d.annualDividendK || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-purple-300">' + (d.prevReducedCumPaidUp || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-purple-300">' + (d.beforeReductionCumPaidUp || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-green-300">' + (d.deathA || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-green-300">' + (d.deathD || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-green-300">' + (d.deathX || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-green-400 font-bold">' + (d.deathNoWithdraw || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-blue-300">' + (d.surrenderB || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-blue-300">' + (d.surrenderE || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-blue-300">' + (d.surrenderY || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-blue-400 font-bold">' + (d.surrenderNoWithdraw || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-orange-300 font-bold">' + (d.surrenderNoWithdrawTWD || 0).toLocaleString() + '</td>';
+    html += '<td class="px-1 py-1 text-right text-red-300">' + (row.reductionRatio > 0 ? (row.reductionRatio * 100).toFixed(4) + '%' : '') + '</td>';
+    html += '<td class="px-1 py-1 text-right text-pink-300">' + (row.cumulativeReductionFactor < 1 ? (row.cumulativeReductionFactor * 100).toFixed(4) + '%' : '100%') + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  
+  // 工廠數據參考
+  html += '<div class="p-2 bg-blue-500/10 text-xs">';
+  html += '<p class="text-blue-300 font-bold mb-1">📊 工廠參考數據：</p>';
+  html += '<p class="text-white/70">第9年：解約=958,104 | Qt=56,012 | Q=50,000</p>';
+  html += '<p class="text-white/70">第10年：解約=937,314 | Qt=54,129 | Q=47,391</p>';
+  html += '<p class="text-yellow-300 mt-1">v7.19：等比例切割法 - K=保留比例=1-R，所有組件×K，解約金=縮減後剩餘保單價值</p>';
+  html += '</div>';
+  html += '</div>';
+  
+  // 說明
+  html += '<div class="glass rounded-xl p-4 mt-4 text-sm bg-orange-500/10">';
+  html += '<p class="text-orange-300 font-semibold mb-2">💡 部份提領試算說明 (v7.19 等比例切割法)</p>';
+  html += '<ul class="text-white/70 list-disc list-inside space-y-1">';
+  html += '<li>提領金額以<strong class="text-orange-300">萬 TWD</strong>為單位</li>';
+  html += '<li><strong class="text-yellow-300">縮減比例 R</strong> = 提領 / 前一年末解約金</li>';
+  html += '<li><strong class="text-green-300">保留比例 K</strong> = 1 - R（當年所有組件 × K）</li>';
+  html += '<li><strong class="text-pink-300">累計因子</strong>：每年累乘 K（歷年累積效果）</li>';
+  html += '<li><strong class="text-blue-300">解約金</strong> = 縮減後剩餘保單價值（提領是年初結算的）</li>';
+  html += '</ul>';
+  html += '</div>';
+  
+  return html;
+}
+
+loadProducts();
+</script>
+</body>
+</html>
